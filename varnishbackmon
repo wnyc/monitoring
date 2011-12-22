@@ -1,0 +1,190 @@
+#!/usr/bin/env python
+"""
+varnishbackmon - A Varnish backend monitor
+
+Usage:
+  varnishlog -b | varnishbackmon
+
+varnishbackmon will ignore requests that reuse existing sessions to the
+backends if the sessions started before varnishbackmon. This means that the
+output may not be totally accurate at first.
+"""
+
+
+from collections import namedtuple
+from time import time
+
+
+FIELDS = [ # List of (heading, width)
+    ('Backend', 20),
+    ('Sess', 5),
+    ('Url', 50),
+    ('Time', 5),
+    ('Response', 15)
+]
+UPDATE_DELAY = 1
+OLD_INFO_EXPIRE_SECS = 3
+
+
+class Session:
+    def __init__(self, id, start, end, backend, requests):
+        self.id = id
+        self.start = start
+        self.end = end
+        self.backend = backend
+        self.requests = requests # A list of Requests with newest at the end.
+    
+    def __repr__(self):
+        args = [self.id, self.start, self.end, self.backend, self.requests]
+        as_str = [str(x) for x in args]
+        return 'Session(%s)' % ', '.join(as_str)
+
+
+class Request:
+    def __init__(self, start, end, host, url, status):
+        self.start = start
+        self.end = end # If None, the request is in progress.
+        self.host = host
+        self.url = url
+        self.status = status
+    
+    def __repr__(self):
+        args = [self.start, self.end, self.host, self.url, self.status]
+        as_str = [str(x) for x in args]
+        return 'Request(%s)' % ', '.join(as_str)
+
+
+def main():
+    recent_sessions = [] # Includes open sessions. Newest at the end.
+    open_sessions = {} # session_id: Session. Refers to some of same Sessions as sessions list.
+    next_output = time()
+    next_clean = time()
+    while True:
+        try:
+            line = raw_input()
+        except EOFError:
+            return
+        if line.strip() == '':
+            continue
+#        print "Processing:", line
+        process_line(line, recent_sessions, open_sessions)
+        now = time()
+        if now >= next_clean:
+            next_clean = now + 1
+            clean_old_info(recent_sessions)
+        if now >= next_output:
+            next_output = now + UPDATE_DELAY
+            output_status(recent_sessions)
+
+
+def process_line(line, recent_sessions, open_sessions):
+    """Modifies recent_sessions and open_sessions."""
+    HOST_PREFIX = 'Host: '
+    session_id, op, talking_to, info = line.split(None, 3)
+    if talking_to != 'b': # b = backend
+        # This won't happen if you give -b to varnishlog.
+        return
+    if op == 'BackendOpen':
+        session = Session(session_id, time(), None, info.split()[0], [])
+        recent_sessions.append(session)
+        open_sessions[session_id] = session
+        return
+    try:
+        session = open_sessions[session_id]
+    except KeyError:
+#        print ("A log entry came in for a session that this program doesn't "
+#               "know about. This is probably because the session started "
+#               "before you ran the program.")
+        return
+    if op == 'BackendClose':
+        session.end = time()
+        del open_sessions[session_id]
+        return
+    # Ignoring BackendReuse. Assuming anything not closed is reused.
+    
+    if op == 'TxRequest':
+        session.requests.append(Request(time(), None, None, None, None))
+        return
+    request = session.requests[-1]
+    if op == 'TxURL':
+        request.url = info
+    elif op == 'TxHeader' and info.startswith(HOST_PREFIX):
+        request.host = info[len(HOST_PREFIX):]
+    elif op == 'RxStatus':
+        request.end = time()
+        request.status = info
+
+
+def clean_old_info(recent_sessions):
+    """Modifies recent_sessions."""
+    now = time()
+    i = 0
+    while i < len(recent_sessions):
+        session = recent_sessions[i]
+        if session.end and now - session.end > OLD_INFO_EXPIRE_SECS:
+            recent_sessions.pop(i)
+            i -= 1
+        else:
+            j = 0
+            while j < len(session.requests):
+                request = session.requests[j]
+                if request.end and now - request.end > OLD_INFO_EXPIRE_SECS:
+                    session.requests.pop(j)
+                    j -= 1
+                j += 1
+        i += 1
+
+
+def output_status(recent_sessions):
+    print '\n' * 80
+    by_backend = {} # backend: [session, session, ...]
+    for session in recent_sessions:
+        if session.backend not in by_backend:
+            by_backend[session.backend] = []
+        by_backend[session.backend].append(session)
+    headers = [f[0] for f in FIELDS]
+    output_line(*headers)
+    for backend in sorted(by_backend.keys()):
+        output_backend(backend, by_backend[backend])
+
+
+def output_backend(backend, sessions):
+    first_line_for_backend = True
+    for session in sessions:
+        for request in session.requests:
+            line_backend = backend if first_line_for_backend else ''
+            output_request(line_backend, session, request)
+            first_line_for_backend = False
+
+
+def output_request(backend, session, request):
+    if request.host is None or request.url is None:
+        url = ''
+    else:
+        url = request.host + request.url
+    if not request.start:
+        resp_time = 0
+    elif not request.end:
+        resp_time = time() - request.start
+    else:
+        resp_time = request.end - request.start
+    resp_time = round(resp_time, 2)
+    if not request.end:
+        response = 'In progress'
+    else:
+        response = request.status
+    output_line(backend, session.id, url, resp_time, response)
+
+
+def output_line(*args):
+    for x in zip(args, FIELDS):
+        data = str(x[0])
+        width = x[1][1]
+        trunc_data = data[:width]
+        fmt_str = '{0:<%s} ' % width
+        print fmt_str.format(trunc_data),
+    print ''
+
+
+if __name__ == '__main__':
+    main()
