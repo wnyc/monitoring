@@ -3,15 +3,18 @@
 varnishbackmon - A Varnish backend monitor
 
 Usage:
-  varnishlog -b | varnishbackmon
+  varnishlog | varnishbackmon [--only-in-progress]
 
-varnishbackmon will ignore requests that reuse existing sessions to the
-backends if the sessions started before varnishbackmon. This means that the
-output may not be totally accurate at first.
+varnishbackmon will ignore requests, and requests that reuse sessions, if the
+request or session started before varnishbackmon. This means that the output
+may not be totally accurate at first.
+
 """
 
 
 from collections import namedtuple
+import re
+import sys
 from time import time
 
 
@@ -54,7 +57,8 @@ class Request:
         return 'Request(%s)' % ', '.join(as_str)
 
 
-def main():
+def main(argv):
+    include_ended = '--only-in-progress' not in argv
     recent_sessions = [] # Includes open sessions. Newest at the end.
     open_sessions = {} # session_id: Session. Refers to some of same Sessions as sessions list.
     next_output = time()
@@ -71,7 +75,7 @@ def main():
         now = time()
         if now >= next_clean:
             next_clean = now + 1
-            clean_old_info(recent_sessions)
+            clean_old_info(recent_sessions, include_ended)
         if now >= next_output:
             next_output = now + UPDATE_DELAY
             output_status(recent_sessions)
@@ -80,6 +84,10 @@ def main():
 def process_line(line, recent_sessions, open_sessions):
     """Modifies recent_sessions and open_sessions."""
     HOST_PREFIX = 'Host: '
+    # Ignore lines that don't start with a number. Health checks show up in the
+    # log and break things if processed.
+    if not re.match('^ *[0-9]', line):
+        return
     session_id, op, talking_to, info = line.split(None, 3)
     if talking_to != 'b': # b = backend
         # This won't happen if you give -b to varnishlog.
@@ -93,8 +101,8 @@ def process_line(line, recent_sessions, open_sessions):
         session = open_sessions[session_id]
     except KeyError:
 #        print ("A log entry came in for a session that this program doesn't "
-#               "know about. This is probably because the session started "
-#               "before you ran the program.")
+#               "know about. This is probably because it started before you "
+#               "ran the program.")
         return
     if op == 'BackendClose':
         session.end = time()
@@ -105,7 +113,13 @@ def process_line(line, recent_sessions, open_sessions):
     if op == 'TxRequest':
         session.requests.append(Request(time(), None, None, None, None))
         return
-    request = session.requests[-1]
+    try:
+        request = session.requests[-1]
+    except IndexError:
+#        print ("A log entry came in for a request that this program doesn't "
+#               "know about. This is probably because it started before you "
+#               "ran the program.")
+        return
     if op == 'TxURL':
         request.url = info
     elif op == 'TxHeader' and info.startswith(HOST_PREFIX):
@@ -115,20 +129,25 @@ def process_line(line, recent_sessions, open_sessions):
         request.status = info
 
 
-def clean_old_info(recent_sessions):
-    """Modifies recent_sessions."""
+def clean_old_info(recent_sessions, include_ended):
+    """
+    Modifies recent_sessions. If show_recent is True, leaves ended requests
+    for OLD_INFO_EXPIRE_SECS after they end.
+    
+    """
+    expire_secs = OLD_INFO_EXPIRE_SECS if include_ended else 0
     now = time()
     i = 0
     while i < len(recent_sessions):
         session = recent_sessions[i]
-        if session.end and now - session.end > OLD_INFO_EXPIRE_SECS:
+        if session.end and now - session.end > expire_secs:
             recent_sessions.pop(i)
             i -= 1
         else:
             j = 0
             while j < len(session.requests):
                 request = session.requests[j]
-                if request.end and now - request.end > OLD_INFO_EXPIRE_SECS:
+                if request.end and now - request.end > expire_secs:
                     session.requests.pop(j)
                     j -= 1
                 j += 1
@@ -187,4 +206,4 @@ def output_line(*args):
 
 
 if __name__ == '__main__':
-    main()
+    main(sys.argv)
